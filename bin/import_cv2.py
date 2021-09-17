@@ -7,7 +7,6 @@ DeepSpeech.py
 Use "python3 import_cv2.py -h" for help
 """
 import csv
-import itertools
 import os
 import subprocess
 import unicodedata
@@ -24,27 +23,40 @@ from deepspeech_training.util.importers import (
     get_validate_label,
     print_import_report,
 )
-from deepspeech_training.util.text import Alphabet
+from ds_ctcdecoder import Alphabet
 
 FIELDNAMES = ["wav_filename", "wav_filesize", "transcript"]
 SAMPLE_RATE = 16000
+CHANNELS = 1
 MAX_SECS = 10
+PARAMS = None
+FILTER_OBJ = None
 
 
-def _preprocess_data(tsv_dir, audio_dir, filter_obj, space_after_every_character=False):
-    exclude = []
-    for dataset in ["test", "dev", "train", "validated", "other"]:
-        set_samples = _maybe_convert_set(dataset, tsv_dir, audio_dir, filter_obj, space_after_every_character)
-        if dataset in ["test", "dev"]:
-            exclude += set_samples
-        if dataset == "validated":
-            _maybe_convert_set("train-all", tsv_dir, audio_dir, filter_obj, space_after_every_character,
-                               rows=set_samples, exclude=exclude)
+class LabelFilter:
+    def __init__(self, normalize, alphabet, validate_fun):
+        self.normalize = normalize
+        self.alphabet = alphabet
+        self.validate_fun = validate_fun
+
+    def filter(self, label):
+        if self.normalize:
+            label = unicodedata.normalize("NFKD", label.strip()).encode("ascii", "ignore").decode("ascii", "ignore")
+        label = self.validate_fun(label)
+        if self.alphabet and label and not self.alphabet.CanEncode(label):
+            label = None
+        return label
 
 
-def one_sample(args):
+def init_worker(params):
+    global FILTER_OBJ  # pylint: disable=global-statement
+    validate_label = get_validate_label(params)
+    alphabet = Alphabet(params.filter_alphabet) if params.filter_alphabet else None
+    FILTER_OBJ = LabelFilter(params.normalize, alphabet, validate_label)
+
+
+def one_sample(sample):
     """ Take an audio file, and optionally convert it to 16kHz WAV """
-    sample, filter_obj = args
     mp3_filename = sample[0]
     if not os.path.splitext(mp3_filename.lower())[1] == ".mp3":
         mp3_filename += ".mp3"
@@ -60,7 +72,7 @@ def one_sample(args):
                 ["soxi", "-s", wav_filename], stderr=subprocess.STDOUT
             )
         )
-    label = filter_obj.filter(sample[1])
+    label = FILTER_OBJ.filter(sample[1])
     rows = []
     counter = get_counter()
     if file_size == -1:
@@ -78,6 +90,7 @@ def one_sample(args):
     else:
         # This one is good - keep it for the target CSV
         rows.append((os.path.split(wav_filename)[-1], file_size, label, sample[2]))
+        counter["imported_time"] += frames
     counter["all"] += 1
     counter["total_time"] += frames
 
@@ -109,10 +122,9 @@ def _maybe_convert_set(dataset, tsv_dir, audio_dir, filter_obj, space_after_ever
         num_samples = len(samples)
 
         print("Importing mp3 files...")
-        pool = Pool()
+        pool = Pool(initializer=init_worker, initargs=(PARAMS,))
         bar = progressbar.ProgressBar(max_value=num_samples, widgets=SIMPLE_BAR)
-        samples_with_context = itertools.zip_longest(samples, [], fillvalue=filter_obj)
-        for i, processed in enumerate(pool.imap_unordered(one_sample, samples_with_context), start=1):
+        for i, processed in enumerate(pool.imap_unordered(one_sample, samples), start=1):
             counter += processed[0]
             rows += processed[1]
             bar.update(i)
@@ -127,7 +139,7 @@ def _maybe_convert_set(dataset, tsv_dir, audio_dir, filter_obj, space_after_ever
 
     output_csv = os.path.join(os.path.abspath(audio_dir), dataset + ".csv")
     print("Saving new DeepSpeech-formatted CSV file to: ", output_csv)
-    with open(output_csv, "w", encoding="utf-8") as output_csv_file:
+    with open(output_csv, "w", encoding="utf-8", newline="") as output_csv_file:
         print("Writing CSV file for DeepSpeech.py as: ", output_csv)
         writer = csv.DictWriter(output_csv_file, fieldnames=FIELDNAMES)
         writer.writeheader()
@@ -154,37 +166,28 @@ def _maybe_convert_set(dataset, tsv_dir, audio_dir, filter_obj, space_after_ever
     return rows
 
 
+def _preprocess_data(tsv_dir, audio_dir, space_after_every_character=False):
+    exclude = []
+    for dataset in ["test", "dev", "train", "validated", "other"]:
+        set_samples = _maybe_convert_set(dataset, tsv_dir, audio_dir, space_after_every_character)
+        if dataset in ["test", "dev"]:
+            exclude += set_samples
+        if dataset == "validated":
+            _maybe_convert_set("train-all", tsv_dir, audio_dir, space_after_every_character,
+                               rows=set_samples, exclude=exclude)
+
+
 def _maybe_convert_wav(mp3_filename, wav_filename):
     if not os.path.exists(wav_filename):
         transformer = sox.Transformer()
-        transformer.convert(samplerate=SAMPLE_RATE)
+        transformer.convert(samplerate=SAMPLE_RATE, n_channels=CHANNELS)
         try:
             transformer.build(mp3_filename, wav_filename)
         except sox.core.SoxError:
             pass
 
-class LabelFilter:
-    def __init__(self, normalize, alphabet, validate_fun):
-        self.normalize = normalize
-        self.alphabet = alphabet
-        self.validate_fun = validate_fun
 
-    def filter(self, label):
-        if self.normalize:
-            label = (
-                unicodedata.normalize("NFKD", label.strip())
-                .encode("ascii", "ignore")
-                .decode("ascii", "ignore")
-            )
-        label = self.validate_fun(label)
-        if self.alphabet and label:
-            try:
-                self.alphabet.encode(label)
-            except KeyError:
-                label = None
-        return label
-
-def main():
+def parse_args():
     parser = get_importers_parser(description="Import CommonVoice v2.0 corpora")
     parser.add_argument("tsv_dir", help="Directory containing tsv files")
     parser.add_argument(
@@ -205,18 +208,14 @@ def main():
         action="store_true",
         help="To help transcript join by white space",
     )
+    return parser.parse_args()
 
-    params = parser.parse_args()
-    validate_label = get_validate_label(params)
 
-    audio_dir = (
-        params.audio_dir if params.audio_dir else os.path.join(params.tsv_dir, "clips")
-    )
-    alphabet = Alphabet(params.filter_alphabet) if params.filter_alphabet else None
+def main():
+    audio_dir = PARAMS.audio_dir if PARAMS.audio_dir else os.path.join(PARAMS.tsv_dir, "clips")
+    _preprocess_data(PARAMS.tsv_dir, audio_dir, PARAMS.space_after_every_character)
 
-    filter_obj = LabelFilter(params.normalize, alphabet, validate_label)
-    _preprocess_data(params.tsv_dir, audio_dir, filter_obj,
-                     params.space_after_every_character)
 
 if __name__ == "__main__":
+    PARAMS = parse_args()
     main()

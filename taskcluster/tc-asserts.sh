@@ -227,7 +227,7 @@ assert_correct_ldc93s1_prodtflitemodel()
   fi;
 
   if [ "$3" = "8k" ]; then
-    assert_correct_inference "$1" "she had to do so in greasy wash water all year" "$2"
+    assert_correct_inference "$1" "she had to do so and greasy wash water all year" "$2"
   fi;
 }
 
@@ -522,6 +522,25 @@ run_multi_inference_tests()
   status=$?
   set -e +o pipefail
   assert_correct_multi_ldc93s1 "${multi_phrase_pbmodel_withlm}" "$status"
+}
+
+run_hotword_tests()
+{
+  DS_BINARY_FILE=${DS_BINARY_FILE:-"deepspeech"}
+  set +e
+  hotwords_decode=$(${DS_BINARY_PREFIX}${DS_BINARY_FILE} --model ${TASKCLUSTER_TMP_DIR}/${model_name_mmap} --scorer ${TASKCLUSTER_TMP_DIR}/kenlm.scorer --audio ${TASKCLUSTER_TMP_DIR}/${ldc93s1_sample_filename} --hot_words "foo:0.0,bar:-0.1" 2>${TASKCLUSTER_TMP_DIR}/stderr)
+  status=$?
+  set -e
+  assert_working_ldc93s1_lm "${hotwords_decode}" "$status"
+}
+
+run_android_hotword_tests()
+{
+  set +e
+  hotwords_decode=$(${DS_BINARY_PREFIX}deepspeech --model ${DATA_TMP_DIR}/${model_name} --scorer ${DATA_TMP_DIR}/kenlm.scorer --audio ${DATA_TMP_DIR}/${ldc93s1_sample_filename} --hot_words "foo:0.0,bar:-0.1" 2>${TASKCLUSTER_TMP_DIR}/stderr)
+  status=$?
+  set -e
+  assert_correct_ldc93s1_lm "${hotwords_decode}" "$status"
 }
 
 run_cpp_only_inference_tests()
